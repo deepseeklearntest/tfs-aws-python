@@ -1,0 +1,33 @@
+# Saved Britive credentials — never commit real credentials
+britive_creds.json
+.env
+.env.*
+!.env.example
+
+# Generated scan and report output
+findings/
+/reports/
+*.csv
+*.tsv
+*.xlsx
+*.xls
+*.xlsm
+*.xlsb
+*.ods
+*.parquet
+*.log
+*.pdf
+/graph_snapshot.png
+
+# Local Claude state
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/

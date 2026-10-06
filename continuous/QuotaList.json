@@ -1,0 +1,65 @@
+[
+  {
+    "id": "s3-buckets-per-account",
+    "description": "S3 buckets per account",
+    "service": "s3",
+    "scope": "account",
+    "check": "list_buckets_count",
+    "limit": 10000,
+    "warn_pct": 70
+  },
+  {
+    "id": "lambda-vpc-enis",
+    "description": "Lambda VPC ENIs (Hyperplane ENIs)",
+    "service": "lambda",
+    "scope": "account",
+    "check": "lambda_vpc_eni_count",
+    "limit": 250,
+    "warn_pct": 70
+  },
+  {
+    "id": "iam-roles-per-account",
+    "description": "IAM roles per account",
+    "service": "iam",
+    "scope": "account",
+    "check": "iam_role_count",
+    "limit": 1000,
+    "warn_pct": 70
+  },
+  {
+    "id": "iam-policies-per-account",
+    "description": "Customer-managed IAM policies",
+    "service": "iam",
+    "scope": "account",
+    "check": "iam_policy_count",
+    "limit": 1500,
+    "warn_pct": 70
+  },
+  {
+    "id": "vpc-per-region",
+    "description": "VPCs per region",
+    "service": "ec2",
+    "scope": "region",
+    "check": "vpc_count",
+    "limit": 5,
+    "warn_pct": 80
+  },
+  {
+    "id": "eip-per-region",
+    "description": "Elastic IPs per region",
+    "service": "ec2",
+    "scope": "region",
+    "check": "eip_count",
+    "limit": 5,
+    "warn_pct": 80
+  },
+  {
+    "id": "acm-certificates-per-region",
+    "description": "ACM certificates per region",
+    "service": "acm",
+    "scope": "region",
+    "check": "acm_cert_count",
+    "limit": 2500,
+    "warn_pct": 70
+  }
+]
