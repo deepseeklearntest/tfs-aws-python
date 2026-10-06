@@ -20,7 +20,7 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from common.findings_io import WAVE_MAP
+from common.findings_io import WAVE_MAP, is_complete_csv
 
 
 # ---------------------------------------------------------------------------
@@ -69,7 +69,7 @@ def _collect_csvs(findings_dir: Path, since_days: int | None) -> list[Path]:
     for path in findings_dir.rglob('*.csv'):
         if 'logs' in path.parts:
             continue
-        if path.name.startswith('inventory_'):
+        if path.name.startswith('inventory_') or not is_complete_csv(path):
             continue
         if cutoff is not None:
             mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)

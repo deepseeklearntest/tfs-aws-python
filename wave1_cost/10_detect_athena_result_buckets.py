@@ -49,6 +49,10 @@ def _get_lifecycle_gaps(s3, bucket_name: str) -> tuple[bool, bool]:
     for rule in rules:
         if rule.get('Status') != 'Enabled':
             continue
+        # A rule limited by prefix, tags, or size cannot prove bucket-wide
+        # coverage. Only an empty legacy Prefix or empty Filter covers all.
+        if rule.get('Prefix', '') or any(rule.get('Filter', {}).values()):
+            continue
         if rule.get('Expiration', {}).get('Days', 9999) <= EXPIRY_DAYS_EXPECTED:
             has_expiry = True
         if rule.get('AbortIncompleteMultipartUpload', {}).get('DaysAfterInitiation', 9999) <= MPU_ABORT_DAYS_EXPECTED:
@@ -59,7 +63,7 @@ def _get_lifecycle_gaps(s3, bucket_name: str) -> tuple[bool, bool]:
 def _get_bucket_region(s3, bucket_name: str) -> str:
     try:
         loc = s3.get_bucket_location(Bucket=bucket_name)['LocationConstraint']
-        return loc or 'us-east-1'
+        return 'eu-west-1' if loc == 'EU' else (loc or 'us-east-1')
     except Exception:
         return 'unknown'
 
@@ -81,7 +85,8 @@ def _get_bucket_size_gb(cw, bucket_name: str) -> float:
         )
         points = resp.get('Datapoints', [])
         return max((d['Average'] for d in points), default=0.0) / (1024 ** 3)
-    except Exception:
+    except Exception as exc:
+        session.mark_incomplete(f'Could not retrieve bucket size: {exc}')
         return 0.0
 
 
@@ -124,7 +129,6 @@ def _get_object_ages(s3, bucket_name: str) -> tuple[int | None, int | None, int]
 
 def scan(sess, account_id: str, writer) -> None:
     s3 = sess.client('s3', region_name='us-east-1')
-    cw = sess.client('cloudwatch', region_name='us-east-1')
 
     try:
         buckets = [
@@ -152,6 +156,10 @@ def scan(sess, account_id: str, writer) -> None:
             continue
 
         bucket_region = _get_bucket_region(s3, name)
+        if bucket_region == 'unknown':
+            session.mark_incomplete(f'Could not determine region for {name}')
+            continue
+        cw = sess.client('cloudwatch', region_name=bucket_region)
         size_gb = _get_bucket_size_gb(cw, name)
         monthly_cost = size_gb * pricing.s3_standard_per_gb(bucket_region)
         oldest_days, newest_days, obj_count = _get_object_ages(s3, name)

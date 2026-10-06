@@ -18,7 +18,9 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from common.findings_io import WAVE_MAP
+from common.findings_io import WAVE_MAP, severity_of, discover_latest_csvs
+
+from common.spreadsheet import append_literal_row, set_literal_cell
 
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
@@ -89,39 +91,8 @@ _HEADER_FONT = Font(bold=True, color='FFFFFF')
 # ---------------------------------------------------------------------------
 
 def discover_csvs(findings_dir: str) -> list[Path]:
-    """Return the latest CSV per script name, excluding logs/ paths and inventory_* files."""
-    root = Path(findings_dir)
-    if not root.exists():
-        raise FileNotFoundError(f"findings directory not found: {root}")
+    return discover_latest_csvs(findings_dir)
 
-    # script_name -> (timestamp_str, path)
-    latest: dict[str, tuple[str, Path]] = {}
-
-    for csv_path in root.rglob('*.csv'):
-        # Exclude any path segment named 'logs'
-        if 'logs' in csv_path.parts:
-            continue
-        # Exclude inventory_ aggregator output
-        if csv_path.name.startswith('inventory_'):
-            continue
-
-        # Expect: {script_name}_{YYYYMMDD}_{HHMMSS}.csv
-        m = re.match(r'^(.+?)_(\d{8})_(\d{6})$', csv_path.stem)
-        if not m:
-            continue
-
-        script_name = m.group(1)
-        timestamp = m.group(2) + m.group(3)   # 14-char string; lexical sort == chronological
-
-        if script_name not in latest or timestamp > latest[script_name][0]:
-            latest[script_name] = (timestamp, csv_path)
-
-    return sorted(v[1] for v in latest.values())
-
-
-# ---------------------------------------------------------------------------
-# Loading
-# ---------------------------------------------------------------------------
 
 def wave_of(script_name: str) -> str | None:
     """Map script name (e.g. '06_detect_nat_gateway_hotpaths') to a wave key."""
@@ -216,80 +187,32 @@ def load_from_inventory(findings_dir: str) -> list[dict]:
 RagResult = tuple[PatternFill, Font]
 
 
+def _rag(wave: str, finding: str, monthly_usd: float) -> RagResult:
+    return {
+        'High': (_RED_FILL, _RED_FONT),
+        'Medium': (_AMBER_FILL, _AMBER_FONT),
+        'Low': (_GREEN_FILL, _GREEN_FONT),
+    }[severity_of(wave, finding, monthly_usd)]
+
+
 def rag_cost(finding: str, monthly_usd: float) -> RagResult:
-    """Savings tier: red > $500, amber $50-$500, green < $50."""
-    if monthly_usd > 500:
-        return _RED_FILL, _RED_FONT
-    if monthly_usd >= 50:
-        return _AMBER_FILL, _AMBER_FONT
-    return _GREEN_FILL, _GREEN_FONT
+    return _rag('wave1_cost', finding, monthly_usd)
 
 
 def rag_lifecycle(finding: str, monthly_usd: float) -> RagResult:
-    f = finding.lower()
-    if 'deprecated-runtime' in f or 'deletion candidate' in f:
-        return _RED_FILL, _RED_FONT
-    if 'eol-soon' in f or 'migrate to alb or nlb' in f:
-        return _AMBER_FILL, _AMBER_FONT
-    return _GREEN_FILL, _GREEN_FONT
+    return _rag('wave2_lifecycle', finding, monthly_usd)
 
 
 def rag_reliability(finding: str, monthly_usd: float) -> RagResult:
-    f = finding.lower()
-    if any(kw in f for kw in ('quota-gap', 'never-tested', 'runbook-never-tested')):
-        return _RED_FILL, _RED_FONT
-    if 'overdue' in f or 'stale' in f:
-        return _AMBER_FILL, _AMBER_FONT
-    return _GREEN_FILL, _GREEN_FONT
+    return _rag('wave3_reliability', finding, monthly_usd)
 
 
 def rag_security(finding: str, monthly_usd: float) -> RagResult:
-    f = finding.lower()
-    # Exact match, not substring: 'open-to-internet' is also a suffix of
-    # 'icmp-open-to-internet' / 'icmp-echo-open-to-internet', which must
-    # stay amber/green respectively rather than escalate to red here.
-    if f == 'open-to-internet':
-        return _RED_FILL, _RED_FONT
-    red_kw = (
-        '0.0.0.0/0', 'unencrypted', 'no-trail', 'trail-not-logging',
-        'no-trail-in-region', 'guardduty-disabled', 'securityhub-disabled',
-        'config-disabled', 'wildcard', 'root key',
-    )
-    if any(kw in f for kw in red_kw):
-        return _RED_FILL, _RED_FONT
-    amber_kw = (
-        'rotation-disabled', 'regional-trail-only', 'log-validation-disabled',
-        'unused-role', 'global-events-excluded', 'icmp-open-to-internet',
-    )
-    if any(kw in f for kw in amber_kw):
-        return _AMBER_FILL, _AMBER_FONT
-    return _GREEN_FILL, _GREEN_FONT
+    return _rag('wave4_security', finding, monthly_usd)
 
 
 def rag_continuous(finding: str, monthly_usd: float) -> RagResult:
-    # Exact finding codes from continuous scripts (43, 46, 48, 49, 52)
-    _RED_CODES = {
-        'quota-at-80pct',          # 48: quota at critical threshold
-        'service-issue',           # 52: active AWS service disruption
-        'retirement-notice',       # 52: resource retirement / EOL notice
-        'no-cloudwatch-agent',     # 46: EC2 instance with no OS-level metrics
-    }
-    _AMBER_CODES = {
-        'quota-at-70pct',                   # 48: quota at warning threshold
-        'custom-quota-threshold-reached',   # 49: custom-tracked limit hit
-        'scheduled-change',                 # 52: scheduled maintenance window
-        'missing-required-tags',            # 43: one or more mandatory tags absent
-        'inconsistent-tag-key',             # 43: non-canonical tag key casing
-        'enhanced-monitoring-disabled',     # 46: RDS without enhanced monitoring
-        'access-logs-disabled',             # 46: ELB without access logs
-        'account-notification',             # 52: general account notification
-    }
-    f = finding.lower()
-    if f in _RED_CODES:
-        return _RED_FILL, _RED_FONT
-    if f in _AMBER_CODES:
-        return _AMBER_FILL, _AMBER_FONT
-    return _GREEN_FILL, _GREEN_FONT
+    return _rag('continuous', finding, monthly_usd)
 
 
 # ---------------------------------------------------------------------------
@@ -341,7 +264,7 @@ def write_top_savings_sheet(wb: Workbook, findings: list[dict]) -> None:
     for row in savings_rows:
         monthly = _safe_float(row.get('estimated_monthly_savings_usd'))
         fill, font = rag_cost('', monthly)
-        ws.append([row.get(c, '') for c in TOP_SAVINGS_COLS])
+        append_literal_row(ws, [row.get(c, '') for c in TOP_SAVINGS_COLS])
         for cell in ws[ws.max_row]:
             cell.fill = fill
             cell.font = font
@@ -393,7 +316,7 @@ def write_by_account_sheet(wb: Workbook, findings: list[dict]) -> None:
     for a in sorted(accounts.values(), key=lambda x: x['account_id']):
         a['est_monthly_savings_usd'] = round(a['est_monthly_savings_usd'], 2)
         a['est_annual_savings_usd'] = round(a['est_annual_savings_usd'], 2)
-        ws.append([a.get(c, 0) for c in BY_ACCOUNT_COLS])
+        append_literal_row(ws, [a.get(c, 0) for c in BY_ACCOUNT_COLS])
 
     m_idx = BY_ACCOUNT_COLS.index('est_monthly_savings_usd') + 1
     a_idx = BY_ACCOUNT_COLS.index('est_annual_savings_usd') + 1
@@ -432,7 +355,7 @@ def write_wave_sheet(
         monthly = _safe_float(row.get('estimated_monthly_savings_usd'))
         finding = row.get('finding', '')
         fill, font = rag_fn(finding, monthly)
-        ws.append([row.get(c, '') for c in cols])
+        append_literal_row(ws, [row.get(c, '') for c in cols])
         for cell in ws[ws.max_row]:
             cell.fill = fill
             cell.font = font
@@ -539,10 +462,10 @@ def write_summary_sheet(wb: Workbook, findings: list[dict]) -> None:
     for rank, row in enumerate(top10, 1):
         monthly = _safe_float(row.get('estimated_monthly_savings_usd'))
         ws.cell(row=data_row, column=1, value=rank)
-        acct_cell = ws.cell(row=data_row, column=2, value=row.get('account_id', ''))
+        acct_cell = set_literal_cell(ws, data_row, 2, row.get('account_id', ''))
         acct_cell.number_format = '@'
-        ws.cell(row=data_row, column=3, value=row.get('resource_type', ''))
-        ws.cell(row=data_row, column=4, value=row.get('finding', ''))
+        set_literal_cell(ws, data_row, 3, row.get('resource_type', ''))
+        set_literal_cell(ws, data_row, 4, row.get('finding', ''))
         m = ws.cell(row=data_row, column=5, value=round(monthly, 2))
         a = ws.cell(row=data_row, column=6, value=round(monthly * 12, 2))
         m.number_format = '$#,##0.00'
@@ -570,7 +493,7 @@ def write_all_findings_sheet(wb: Workbook, findings: list[dict]) -> None:
     ws.append(STANDARD_COLS)
 
     for row in sorted_rows:
-        ws.append([row.get(c, '') for c in STANDARD_COLS])
+        append_literal_row(ws, [row.get(c, '') for c in STANDARD_COLS])
 
     m_idx = STANDARD_COLS.index('estimated_monthly_savings_usd') + 1
     a_idx = STANDARD_COLS.index('estimated_annual_savings_usd') + 1

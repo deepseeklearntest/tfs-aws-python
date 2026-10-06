@@ -7,6 +7,7 @@ Run: python generate_dashboard.py
 import argparse
 import csv
 import json
+from html import escape
 import sys
 import urllib.request
 from collections import Counter, defaultdict
@@ -194,7 +195,7 @@ def _svg_bar(items: list, key_x: str, key_y: str, title: str, color: str = "#1F4
     for i, item in enumerate(items):
         y = 30 + i * (bar_h + gap)
         bw = int((item[key_y] / max_v) * chart_w)
-        label = str(item[key_x])[:22]
+        label = escape(str(item[key_x])[:22])
         val = ("$" + f"{item[key_y]:,.0f}") if isinstance(item[key_y], float) else str(item[key_y])
         bars += (
             '<text x="' + str(label_w - 4) + '" y="' + str(y + bar_h - 6) + '" text-anchor="end" font-size="11" fill="#333">' + label + '</text>'
@@ -204,7 +205,7 @@ def _svg_bar(items: list, key_x: str, key_y: str, title: str, color: str = "#1F4
     svg_w = label_w + chart_w + 80
     return (
         '<svg width="' + str(svg_w) + '" height="' + str(total_h) + '" xmlns="http://www.w3.org/2000/svg">'
-        + '<text x="' + str(svg_w // 2) + '" y="16" text-anchor="middle" font-size="13" font-weight="bold" fill="#222">' + title + '</text>'
+        + '<text x="' + str(svg_w // 2) + '" y="16" text-anchor="middle" font-size="13" font-weight="bold" fill="#222">' + escape(title) + '</text>'
         + bars + '</svg>'
     )
 
@@ -275,6 +276,12 @@ _JS_TABLE = r"""
     accounts.forEach(function(a){ var o = document.createElement("option"); o.value = a; o.textContent = a; aSel.appendChild(o); });
   }
 
+  function esc(value) {
+    return String(value == null ? "" : value).replace(/[&<>"']/g, function(c) {
+      return {"&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#x27;"}[c];
+    });
+  }
+
   function sevClass(s) {
     if (s === "High") return "sev-high";
     if (s === "Medium") return "sev-medium";
@@ -317,13 +324,13 @@ _JS_TABLE = r"""
     var slice = filtered.slice(start, start + PAGE_SIZE);
     tbody.innerHTML = slice.map(function(r) {
       return "<tr>"
-        + "<td>" + r.account_id + "</td>"
-        + "<td>" + r.region + "</td>"
-        + "<td>" + r.wave + "</td>"
-        + "<td>" + r.resource_type + "</td>"
-        + "<td>" + r.finding + "</td>"
-        + "<td>" + (r.owner || "-") + "</td>"
-        + "<td><span class=\"" + sevClass(r.severity) + "\">" + r.severity + "</span></td>"
+        + "<td>" + esc(r.account_id) + "</td>"
+        + "<td>" + esc(r.region) + "</td>"
+        + "<td>" + esc(r.wave) + "</td>"
+        + "<td>" + esc(r.resource_type) + "</td>"
+        + "<td>" + esc(r.finding) + "</td>"
+        + "<td>" + esc(r.owner || "-") + "</td>"
+        + "<td><span class=\"" + sevClass(r.severity) + "\">" + esc(r.severity) + "</span></td>"
         + "<td class=\"money\">" + fmtMoney(r.monthly) + "</td>"
         + "</tr>";
     }).join("");
@@ -511,10 +518,10 @@ def build_html(snapshot_rows: list, all_rows: list, chartjs_src: str | None) -> 
     top10_rows_html = "".join(
         "<tr>"
         + "<td>" + str(i + 1) + "</td>"
-        + "<td>" + r["account_id"] + "</td>"
-        + "<td>" + r["region"] + "</td>"
-        + "<td>" + r["resource_type"] + "</td>"
-        + "<td>" + r["finding"] + "</td>"
+        + "<td>" + escape(str(r["account_id"])) + "</td>"
+        + "<td>" + escape(str(r["region"])) + "</td>"
+        + "<td>" + escape(str(r["resource_type"])) + "</td>"
+        + "<td>" + escape(str(r["finding"])) + "</td>"
         + '<td class="money">$' + f'{r["monthly"]:,.2f}' + "</td>"
         + '<td class="money">$' + f'{r["annual"]:,.2f}' + "</td>"
         + "</tr>"
@@ -537,9 +544,9 @@ def build_html(snapshot_rows: list, all_rows: list, chartjs_src: str | None) -> 
         "<body>",
         "<header>",
         "  <h1>AWS Proactive Findings Dashboard</h1>",
-        '  <span class="meta">Snapshot: ' + data["snapshot_date"] + "</span>",
+        '  <span class="meta">Snapshot: ' + escape(str(data["snapshot_date"])) + "</span>",
         '  <span class="meta">Accounts: ' + str(kpi["accounts_count"]) + "</span>",
-        '  <span class="meta">Detectors: ' + str(kpi["detectors_run"]) + "</span>",
+        '  <span class="meta">Detectors with findings: ' + str(kpi["detectors_run"]) + "</span>",
         "</header>",
         '<div class="container">',
         "",
@@ -561,7 +568,7 @@ def build_html(snapshot_rows: list, all_rows: list, chartjs_src: str | None) -> 
         '    <div class="value">' + f'{kpi["high_severity"]:,}' + "</div>",
         "  </div>",
         '  <div class="kpi-tile blue">',
-        '    <div class="label">Accounts Scanned</div>',
+        '    <div class="label">Accounts with Findings</div>',
         '    <div class="value">' + str(kpi["accounts_count"]) + "</div>",
         "  </div>",
         "</div>",

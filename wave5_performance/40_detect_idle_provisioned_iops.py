@@ -43,7 +43,7 @@ CW_BATCH_SIZE = 500
 log = logging.getLogger(SCRIPT_NAME)
 
 
-def _batch_iops(cw, volume_ids: list[str]) -> dict[str, float]:
+def _batch_iops(cw, volume_ids: list[str]) -> dict[str, float | None]:
     """
     Return {volume_id: actual_avg_iops} over the full LOOKBACK_DAYS window.
 
@@ -78,6 +78,8 @@ def _batch_iops(cw, volume_ids: list[str]) -> dict[str, float]:
 
     # Accumulate totals per volume index
     totals: dict[int, float] = {}
+    observed: set[str] = set()
+    invalid: set[int] = set()
 
     for chunk in session.chunked(queries, CW_BATCH_SIZE):
         try:
@@ -90,19 +92,24 @@ def _batch_iops(cw, volume_ids: list[str]) -> dict[str, float]:
                 for r in resp.get('MetricDataResults', []):
                     qid = r['Id']           # e.g. "v3m1"
                     vals = r.get('Values', [])
-                    if not vals:
-                        continue
-                    # Parse the volume index from the query ID
                     m_sep = qid.index('m')
                     idx = int(qid[1:m_sep])
+                    if r.get('StatusCode', 'Complete') != 'Complete':
+                        invalid.add(idx)
+                    if not vals:
+                        continue
+                    observed.add(qid)
                     totals[idx] = totals.get(idx, 0.0) + sum(vals)
         except ClientError as exc:
             log.warning("CloudWatch batch failed (%d queries): %s", len(chunk), exc)
 
-    result: dict[str, float] = {}
+    result: dict[str, float | None] = {}
     for i, vid in enumerate(volume_ids):
-        total_ops = totals.get(i, 0.0)
-        result[vid] = total_ops / window_seconds  # average IOPS over window
+        if i in invalid or not {f'v{i}m0', f'v{i}m1'} <= observed:
+            result[vid] = None
+            session.mark_incomplete(f'Missing or incomplete IOPS metrics for {vid}')
+        else:
+            result[vid] = totals[i] / window_seconds
 
     return result
 
@@ -163,7 +170,9 @@ def make_scan(threshold: float):
             if provisioned == 0:
                 continue
 
-            actual = actual_iops_map.get(vid, 0.0)
+            actual = actual_iops_map.get(vid)
+            if actual is None:
+                continue
             utilization = actual / provisioned  # fraction 0–1
 
             if utilization >= threshold:

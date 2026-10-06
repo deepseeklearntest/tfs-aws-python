@@ -5,6 +5,8 @@ No boto3, no truststore, no openpyxl. Safe to import from any context.
 from __future__ import annotations
 
 import re
+import json
+import logging
 from pathlib import Path
 
 from common import tags as tagutil
@@ -73,6 +75,22 @@ def normalize_account_id(value: str) -> str:
 # CSV discovery
 # ---------------------------------------------------------------------------
 
+def is_complete_csv(path: Path) -> bool:
+    """Legacy timestamped CSVs are accepted; new manifests must be complete."""
+    if not re.match(r'^.+_\d{8}_\d{6}\.csv$', path.name):
+        if path.name.endswith('.incomplete.csv'):
+            logging.getLogger(__name__).warning('Excluded incomplete scan (older results may remain): %s', path)
+        return False
+    manifest = path.with_suffix('.json')
+    if not manifest.exists():
+        return True
+    try:
+        return json.loads(manifest.read_text(encoding='utf-8')).get('status') == 'complete'
+    except (OSError, ValueError, AttributeError):
+        logging.getLogger(__name__).warning('Invalid run manifest: %s', manifest)
+        return False
+
+
 def discover_latest_csvs(findings_dir: str | Path) -> list[Path]:
     """Return the latest CSV per script name, excluding logs/ and inventory_* files."""
     root = Path(findings_dir)
@@ -84,7 +102,7 @@ def discover_latest_csvs(findings_dir: str | Path) -> list[Path]:
     for csv_path in root.rglob('*.csv'):
         if 'logs' in csv_path.parts:
             continue
-        if csv_path.name.startswith('inventory_'):
+        if csv_path.name.startswith('inventory_') or not is_complete_csv(csv_path):
             continue
 
         m = re.match(r'^(.+?)_(\d{8})_(\d{6})$', csv_path.stem)
@@ -112,9 +130,23 @@ def wave_of(script_name: str) -> str | None:
 # Severity classification
 # ---------------------------------------------------------------------------
 
+FINDING_SEVERITIES = {
+    'guardduty-not-enabled': 'High', 'securityhub-not-enabled': 'High',
+    'config-not-enabled': 'High', 'config-recorder-stopped': 'High',
+    'console-no-mfa': 'High', 'dr-quota-lower-than-primary': 'High',
+    'untested-runbook': 'Medium', 'role-no-recorded-use': 'Medium',
+    'role-never-used': 'Medium', 'stale-key-90d': 'Medium',
+    'key-never-used': 'Medium', 'dormant-user': 'Medium',
+    'wrong-instance-family-memory-starved': 'Medium',
+    'low-cache-hit-rate': 'Medium', 'icmp-echo-open-to-internet': 'Low',
+}
+
+
 def severity_of(wave: str | None, finding: str, monthly_usd: float) -> str:
     """Map wave + finding text + monthly savings to High / Medium / Low."""
     f = finding.lower()
+    if f in FINDING_SEVERITIES:
+        return FINDING_SEVERITIES[f]
 
     if wave in ('wave1_cost', 'wave5_performance'):
         if monthly_usd > 500:
@@ -135,7 +167,7 @@ def severity_of(wave: str | None, finding: str, monthly_usd: float) -> str:
             return 'High'
         if 'overdue' in f or 'stale' in f:
             return 'Medium'
-        return 'Low'
+        return 'Medium'
 
     if wave == 'wave4_security':
         # Exact match, not substring: 'open-to-internet' is also a suffix of
@@ -156,7 +188,7 @@ def severity_of(wave: str | None, finding: str, monthly_usd: float) -> str:
         )
         if any(kw in f for kw in amber_kw):
             return 'Medium'
-        return 'Low'
+        return 'Medium'
 
     if wave == 'continuous':
         _HIGH = {
@@ -179,9 +211,9 @@ def severity_of(wave: str | None, finding: str, monthly_usd: float) -> str:
             return 'High'
         if f in _MEDIUM:
             return 'Medium'
-        return 'Low'
+        return 'Medium'
 
-    return 'Low'
+    return 'Medium'
 
 # ---------------------------------------------------------------------------
 # Tag parsing
