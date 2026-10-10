@@ -149,7 +149,7 @@ def scan(sess, account_id: str, writer) -> None:
         try:
             missing_expiry, missing_mpu = _get_lifecycle_gaps(s3, name)
         except ClientError as exc:
-            log.debug("Lifecycle check failed for %s: %s", name, exc)
+            log.warning("Lifecycle check failed for %s: %s", name, exc)
             continue
 
         if not missing_expiry and not missing_mpu:

@@ -249,6 +249,19 @@ class DetectorTests(unittest.TestCase):
         quotas._check_lambda_vpc_eni_count(sess, 'eu-west-1')
         sess.client.assert_called_once_with('lambda', region_name='eu-west-1')
 
+    def test_athena_lifecycle_access_failure_does_not_publish_complete_scan(self):
+        sess = Mock()
+        s3 = sess.client.return_value
+        s3.list_buckets.return_value = {'Buckets': [{'Name': 'aws-athena-query-results-test'}]}
+        s3.get_bucket_lifecycle_configuration.side_effect = ClientError(
+            {'Error': {'Code': 'AccessDenied'}}, 'GetBucketLifecycleConfiguration')
+        with tempfile.TemporaryDirectory() as folder:
+            with self.assertRaises(session.IncompleteScanError):
+                with output.FindingsWriter(folder, athena.SCRIPT_NAME) as writer:
+                    session.run_parallel([(sess, ACCOUNT, writer)], athena.scan)
+            self.assertEqual(findings_io.discover_latest_csvs(folder), [])
+            self.assertEqual(len(list(Path(folder).rglob('*.incomplete.csv'))), 1)
+
     def test_tagging_merges_untagged_resources_and_derives_type(self):
         tg = Mock()
         arn = f'arn:aws:ec2:us-east-1:{ACCOUNT}:instance/i-test'
