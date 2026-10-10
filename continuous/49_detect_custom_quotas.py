@@ -54,7 +54,7 @@ def _check_list_buckets_count(sess, region: str) -> int | None:
 
 def _check_lambda_vpc_eni_count(sess, region: str) -> int | None:
     """Count Lambda functions that have a VpcConfig attached (proxy for ENI usage)."""
-    lam = sess.client('lambda', region_name='us-east-1')
+    lam = sess.client('lambda', region_name=region)
     count = 0
     try:
         paginator = lam.get_paginator('list_functions')

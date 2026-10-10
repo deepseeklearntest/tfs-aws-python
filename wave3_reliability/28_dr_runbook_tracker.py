@@ -62,7 +62,7 @@ def _days_since(last_test: date | None) -> int | None:
     """Return number of days since last_test, or None if never tested."""
     if last_test is None:
         return None
-    return (date.today() - last_test)
+    return (date.today() - last_test).days
 
 
 def _build_detail(row: dict, last_test: date | None, days_since: int | None) -> str:
@@ -144,18 +144,16 @@ def check_registry(registry_path: Path, threshold_days: int) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def write_findings(findings: list[dict], output_dir: Path) -> Path:
-    """Write findings to a timestamped CSV; return the output path."""
-    output_dir.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')
-    out_path = output_dir / f"{SCRIPT_NAME}_{ts}.csv"
+    """Atomically publish a completed snapshot, including zero findings."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from common.output import FindingsWriter
 
-    with out_path.open('w', newline='', encoding='utf-8') as fh:
-        writer = csv.DictWriter(fh, fieldnames=COMMON_FIELDS, extrasaction='ignore')
-        writer.writeheader()
-        writer.writerows(findings)
-
-    log.info("Wrote %d finding(s) → %s", len(findings), out_path)
-    return out_path
+    with FindingsWriter(str(output_dir), SCRIPT_NAME) as writer:
+        for row in findings:
+            values = {k: v for k, v in row.items() if k != 'scan_time'}
+            values['estimated_monthly_savings_usd'] = float(values['estimated_monthly_savings_usd'])
+            writer.write(**values)
+    return writer._path
 
 
 # ---------------------------------------------------------------------------
@@ -212,7 +210,7 @@ def main() -> None:
 
     if not findings:
         log.info("No stale runbooks found — all workloads tested within %d days.", args.threshold_days)
-        sys.exit(0)
+        # Publish a successful zero-finding snapshot to retire old findings.
 
     out_path = write_findings(findings, output_dir)
     print(f"Found {len(findings)} stale runbook(s). Output: {out_path}")

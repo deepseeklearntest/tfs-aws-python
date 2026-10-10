@@ -6,8 +6,8 @@ Account-level scan (IAM is global).  Detects two classes of risk:
 1. Wildcard policies — any attached or inline policy whose statements grant
    Action:* AND Resource:* (over-privileged roles).
 
-2. Unused roles — roles whose RoleLastUsed.LastUsedDate is absent (never used)
-   or older than 90 days (stale credentials surface area).
+2. Stale roles — last recorded use older than 90 days, or roles older than
+   90 days with no recorded use within IAM's tracking window.
 
 Run: python 37_detect_iam_risky_roles.py --accounts 123456789012,234567890123
 """
@@ -219,6 +219,9 @@ def scan(sess, account_id: str, writer) -> None:
         for page in paginator.paginate():
             for role in page.get('Roles', []):
                 role_name = role['RoleName']
+                # ListRoles omits RoleLastUsed, PermissionsBoundary, and Tags.
+                # Missing usage is unknown until GetRole succeeds.
+                role = iam.get_role(RoleName=role_name)['Role']
                 role_arn = role['Arn']
                 role_path = role.get('Path', '/')
                 role_created_date = str(role['CreateDate'].date())
@@ -235,15 +238,15 @@ def scan(sess, account_id: str, writer) -> None:
                 role_last_used = role.get('RoleLastUsed', {})
                 last_used_date = role_last_used.get('LastUsedDate')
 
-                if last_used_date is None:
-                    # Role has never been used
+                if last_used_date is None and role['CreateDate'] < cutoff:
+                    # Missing usage means no recorded use within IAM's tracking window.
                     writer.write(
                         account_id=account_id,
                         region='global',
                         resource_id=role_arn,
                         resource_type='IAM Role',
-                        finding='role-never-used',
-                        detail=f"Role '{role_name}' has never been used",
+                        finding='role-no-recorded-use',
+                        detail=f"Role '{role_name}' has no recorded use within IAM's tracking window",
                         estimated_monthly_savings_usd=0,
                         tags=None,
                         role_name=role_name,
@@ -252,13 +255,13 @@ def scan(sess, account_id: str, writer) -> None:
                         policy_name='',
                         policy_type='',
                         policy_arn='',
-                        last_used_date='never',
+                        last_used_date='not-recorded',
                         days_unused='',
                         role_created_date=role_created_date,
                         permission_boundary_arn=permission_boundary_arn,
                         trust_principal=trust_principal,
                     )
-                elif last_used_date < cutoff:
+                elif last_used_date is not None and last_used_date < cutoff:
                     days_unused = (now - last_used_date).days
                     writer.write(
                         account_id=account_id,

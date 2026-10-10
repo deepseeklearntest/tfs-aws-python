@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 Task 6 â€” NAT Gateway Egress Hot Paths
 
@@ -58,6 +58,7 @@ def _batch_bytes(cw, nat_gw_ids: list[str]) -> dict[str, float]:
     ]
 
     totals: dict[str, float] = {}
+    invalid: set[str] = set()
     for chunk in session.chunked(queries, CW_BATCH_SIZE):
         try:
             paginator = cw.get_paginator('get_metric_data')
@@ -67,9 +68,17 @@ def _batch_bytes(cw, nat_gw_ids: list[str]) -> dict[str, float]:
                 for r in resp.get('MetricDataResults', []):
                     idx = int(r['Id'][1:])
                     gw_id = nat_gw_ids[idx]
-                    totals[gw_id] = totals.get(gw_id, 0.0) + sum(r.get('Values', []))
+                    values = r.get('Values', [])
+                    if r.get('StatusCode', 'Complete') != 'Complete':
+                        invalid.add(gw_id)
+                    if values:
+                        totals[gw_id] = totals.get(gw_id, 0.0) + sum(values)
         except ClientError as exc:
             log.warning("CloudWatch batch failed (%d queries): %s", len(chunk), exc)
+    for gw_id in nat_gw_ids:
+        if gw_id in invalid or gw_id not in totals:
+            totals.pop(gw_id, None)
+            session.mark_incomplete(f'Missing or incomplete NAT traffic metrics for {gw_id}')
     return totals
 
 
@@ -101,7 +110,9 @@ def make_scan(threshold_gb: float):
 
         for gw in gateways:
             gw_id = gw['NatGatewayId']
-            total_bytes = totals.get(gw_id, 0.0)
+            total_bytes = totals.get(gw_id)
+            if total_bytes is None:
+                continue
             total_gb = total_bytes / (1024 ** 3)
 
             if total_gb < IDLE_GB:

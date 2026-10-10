@@ -1,4 +1,4 @@
-﻿"""
+"""
 Britive-backed multi-account session management with parallel execution helpers.
 
 Usage:
@@ -17,6 +17,8 @@ import truststore
 truststore.inject_into_ssl()
 
 import logging
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -30,6 +32,53 @@ from britive import BritiveKeychain
 
 log = logging.getLogger(__name__)
 
+
+class IncompleteScanError(RuntimeError):
+    """A sweep did not cover every requested task; do not publish it as current."""
+
+
+@dataclass
+class TaskOutcome:
+    target: str
+    issues: list[str] = field(default_factory=list)
+
+    @property
+    def complete(self) -> bool:
+        return not self.issues
+
+
+_active_task: ContextVar[TaskOutcome | None] = ContextVar('scan_task', default=None)
+
+
+def mark_incomplete(reason: str) -> None:
+    outcome = _active_task.get()
+    if outcome is not None and reason not in outcome.issues:
+        outcome.issues.append(reason)
+
+
+class _ScanWarnings(logging.Handler):
+    """Warnings/errors emitted inside a scan are conservative coverage failures.
+
+    This also captures existing detector branches that log and return rather
+    than raising. ContextVar keeps each worker's outcome separate.
+    """
+    def emit(self, record) -> None:
+        if record.levelno >= logging.WARNING:
+            mark_incomplete(record.getMessage())
+
+
+def _run_task(fn: Callable, args: tuple) -> TaskOutcome:
+    outcome = TaskOutcome(_summarise(args))
+    token = _active_task.set(outcome)
+    try:
+        fn(*args)
+    except Exception as exc:
+        mark_incomplete(f'{type(exc).__name__}: {exc}')
+        log.exception('Task failed: %s', outcome.target)
+    finally:
+        _active_task.reset(token)
+    return outcome
+
 SKIP_CODES = frozenset([
     'AuthFailure',
     'UnauthorizedOperation',
@@ -41,7 +90,11 @@ SKIP_CODES = frozenset([
 
 
 def is_skippable(exc: ClientError) -> bool:
-    return exc.response['Error']['Code'] in SKIP_CODES
+    code = exc.response['Error']['Code']
+    skipped = code in SKIP_CODES
+    if skipped:
+        mark_incomplete(f'AWS access skipped: {code}')
+    return skipped
 
 
 def chunked(seq: list, size: int) -> Generator[list, None, None]:
@@ -78,8 +131,7 @@ def _get_enabled_regions(sess: boto3.Session) -> list[str]:
             )['Regions']
         ]
     except Exception as exc:
-        log.warning("Could not enumerate regions (%s). Defaulting to us-east-1.", exc)
-        return ['us-east-1']
+        raise IncompleteScanError("Could not enumerate enabled regions") from exc
 
 
 class AccountIterator:
@@ -119,8 +171,10 @@ class AccountIterator:
             targets = targets[:self._max_accounts]
         self._kc = BritiveKeychain()
         self._kc.collect_creds(targets, creds_file=self._creds_file)
-        if not self._kc.account_keys:
-            log.error("No credentials collected — nothing to scan.")
+        missing = sorted(set(targets) - set(self._kc.account_keys))
+        if missing:
+            self._kc.revoke_all_leases()
+            raise IncompleteScanError(f"Credentials missing for account(s): {', '.join(missing)}")
         return self
 
     def __exit__(self, *_) -> None:
@@ -154,52 +208,43 @@ def run_parallel(
     items: Iterable[tuple],
     fn: Callable,
     max_workers: int = 10,
-) -> None:
-    """
-    Run fn(*args) for each tuple yielded by `items` in parallel.
-    Failures are logged with full traceback; the sweep continues.
+) -> list[TaskOutcome]:
+    """Complete the sweep, returning outcomes or raising on incomplete coverage.
 
-    Set max_workers <= 1 for sequential mode (useful for debugging).
+    Every task runs even if another fails. The caller retains partial results
+    separately; exceptions, skipped permissions, and scan warnings never become
+    a successful empty scan. Running workers are joined before the writer closes.
     """
     materialised = list(items)
     if not materialised:
-        log.warning("No tasks to run.")
-        return
-
-    if max_workers <= 1:
-        log.info("Running %d task(s) sequentially", len(materialised))
-        for args in materialised:
-            try:
-                fn(*args)
-            except Exception:
-                log.exception("Task failed: %s", _summarise(args))
-        return
-
-    log.info("Running %d task(s) in parallel (workers=%d)", len(materialised), max_workers)
-    failures = 0
-    exe = ThreadPoolExecutor(max_workers=max_workers)
-    futures = {exe.submit(fn, *args): args for args in materialised}
+        raise IncompleteScanError('No tasks to run')
+    handler = _ScanWarnings(level=logging.WARNING)
+    root_logger = logging.getLogger()
+    root_logger.addHandler(handler)
+    outcomes = []
     try:
-        for f in as_completed(futures):
-            try:
-                f.result()
-            except Exception:
-                failures += 1
-                log.exception("Task failed: %s", _summarise(futures[f]))
-    except KeyboardInterrupt:
-        # Cancel futures that haven't started yet; running threads finish their
-        # current boto3 call then exit naturally (they are daemon threads).
-        for f in futures:
-            f.cancel()
-        exe.shutdown(wait=False, cancel_futures=True)
-        log.warning("Scan interrupted.")
-        raise
-    else:
-        exe.shutdown(wait=True)
-    if failures:
-        log.warning("Completed with %d failure(s)", failures)
+        if max_workers <= 1:
+            outcomes = [_run_task(fn, args) for args in materialised]
+        else:
+            with ThreadPoolExecutor(max_workers=max_workers) as exe:
+                futures = [exe.submit(_run_task, fn, args) for args in materialised]
+                try:
+                    for future in as_completed(futures):
+                        outcomes.append(future.result())
+                except BaseException:
+                    for future in futures:
+                        future.cancel()
+                    raise
+    finally:
+        root_logger.removeHandler(handler)
+    failed = [o for o in outcomes if not o.complete]
+    if failed:
+        error = IncompleteScanError(f'{len(failed)} of {len(outcomes)} scan task(s) incomplete')
+        error.outcomes = outcomes
+        raise error
+    return outcomes
 
 
 def _summarise(args: tuple) -> str:
     """Render a task argument tuple for log messages without dumping the boto3 Session."""
-    return '/'.join(str(a) for a in args[1:]) if len(args) > 1 else str(args)
+    return '/'.join(str(a) for a in args[1:] if not hasattr(a, 'write')) if len(args) > 1 else 'task'

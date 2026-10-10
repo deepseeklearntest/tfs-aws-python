@@ -25,7 +25,7 @@ pip install -r requirements.txt
 - `truststore` — injects Windows certificate store into Python SSL (required for corporate TLS inspection proxy). Injected once in `common/session.py` before boto3 imports — do NOT add it to individual scripts.
 - `openpyxl` — Excel report generation (`generate_report.py` only)
 
-No build system, no test suite, no CI.
+No build system. Offline regression tests use `python -m unittest discover -s tests -v`; GitHub Actions runs them on Python 3.10–3.12. See README.md for run status and Resource Explorer prerequisites.
 
 ## Running a Detection Script
 
@@ -47,7 +47,7 @@ All scripts accept the same standard CLI flags (from `common/cli.py`):
 | `--keep-runs` | 10 | Number of most-recent CSVs to retain per script; older ones are pruned automatically after each run |
 | `--no-prune` | off | Disable automatic CSV retention for this run (keep every run's CSV forever) |
 
-Output lands in `findings/<wave_subfolder>/<script_name>_<timestamp>.csv` (wave subfolder resolved from the script's numeric prefix via `WAVE_MAP` in `common/findings_io.py`; ad-hoc scripts with no numeric prefix land directly in `findings/`) and `findings/logs/<script_name>_<timestamp>.log`. Each script's CSVs are automatically pruned to the `--keep-runs` most recent (default 10) — every downstream consumer (`generate_report.py`, `build_dataset.py`, `continuous/54_inventory_refresh.py`) only ever reads the newest CSV per script, so this is safe. The actual historical trend store is `dataset/findings_dataset.csv` (append-only, one row set per `snapshot_date`, built by `build_dataset.py`) — that is untouched by pruning.
+Only completed sweeps enter aggregate reporting; samples and failures are retained with `.sample.csv` / `.incomplete.csv` suffixes and JSON manifests (see README.md). Completed output lands in `findings/<wave_subfolder>/<script_name>_<timestamp>.csv` (wave subfolder resolved from the script's numeric prefix via `WAVE_MAP` in `common/findings_io.py`; ad-hoc scripts with no numeric prefix land directly in `findings/`) and `findings/logs/<script_name>_<timestamp>.log`. Each script's CSVs are automatically pruned to the `--keep-runs` most recent (default 10) — every downstream consumer (`generate_report.py`, `build_dataset.py`, `continuous/54_inventory_refresh.py`) only ever reads the newest CSV per script, so this is safe. The actual historical trend store is `dataset/findings_dataset.csv` (append-only, one row set per `snapshot_date`, built by `build_dataset.py`) — that is untouched by pruning.
 
 ## Saved Credentials
 
@@ -127,7 +127,7 @@ Four custom Claude skills are in `.claude/skills/`:
 
 ## Architecture: common/ Package
 
-- **`session.py`** — Injects `truststore` at import time (before boto3 loads). `AccountIterator` context manager collects Britive credentials once then iterates accounts/regions. `run_parallel()` fans tasks over `ThreadPoolExecutor`. `SKIP_CODES` lists `ClientError` codes to silently skip. `chunked()` batches CloudWatch metric queries.
+- **`session.py`** — Injects `truststore` at import time (before boto3 loads). `AccountIterator` context manager collects Britive credentials once then iterates accounts/regions. `run_parallel()` fans tasks over `ThreadPoolExecutor`, records per-task outcomes, and raises on failures, skipped access, or scan warnings. `SKIP_CODES` lists `ClientError` codes that skip a service and mark the task incomplete. `chunked()` batches CloudWatch metric queries.
 - **`cli.py`** — `make_parser()` + `run()` compose argparse boilerplate and wire `AccountIterator` → `FindingsWriter` → `run_parallel()`.
 - **`output.py`** — Thread-safe `FindingsWriter` writing to a timestamped CSV. All scripts share `COMMON_FIELDS`; script-specific columns added via `extra_fields`.
 - **`pricing.py`** — Region-aware pricing helpers (EBS, EIP, LB, NAT, RDS, EC2). Base prices are us-east-1 × `REGION_MULTIPLIER`. Use `pricing.<helper>(region)` — never hardcode prices.

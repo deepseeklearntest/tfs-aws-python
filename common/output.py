@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import csv
 import logging
+import json
+import tempfile
 import re
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 from common.findings_io import wave_of
@@ -50,18 +52,45 @@ class FindingsWriter:
         script_name: str,
         extra_fields: list[str] | None = None,
         keep_runs: int | None = DEFAULT_KEEP_RUNS,
+        sample: bool = False,
+        scope: dict | None = None,
     ) -> None:
-        ts = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')
+        if keep_runs is not None and keep_runs < 1:
+            raise ValueError('keep_runs must be positive or None')
         subfolder = wave_of(script_name)
         base = Path(output_dir) / subfolder if subfolder else Path(output_dir)
-        path = base / f"{script_name}_{ts}.csv"
-        path.parent.mkdir(parents=True, exist_ok=True)
+        base.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc)
+        while True:
+            path = base / f"{script_name}_{stamp.strftime('%Y%m%d_%H%M%S')}.csv"
+            reservation = path.with_suffix('.run')
+            try:
+                with reservation.open('x'):
+                    pass
+            except FileExistsError:
+                stamp += timedelta(seconds=1)
+                continue
+            if path.exists() or path.with_suffix('.json').exists() or list(base.glob(path.stem + '.*.csv')):
+                reservation.unlink()
+                stamp += timedelta(seconds=1)
+                continue
+            break
+        self._reservation = reservation
 
         self._path = path
+        self._sample = sample
+        self._scope = scope or {}
+        self._outcomes = []
+        self._closed = False
+        self._started_at = datetime.now(timezone.utc).isoformat()
         self._script_name = script_name
         self._keep_runs = keep_runs
         self._fields = COMMON_FIELDS + (extra_fields or [])
-        self._fh = open(path, 'w', newline='', encoding='utf-8')
+        self._fh = tempfile.NamedTemporaryFile(
+            mode='w', newline='', encoding='utf-8', dir=base,
+            prefix=f'.{script_name}_', suffix='.partial.csv', delete=False,
+        )
+        self._staged_path = Path(self._fh.name)
         self._writer = csv.DictWriter(
             self._fh, fieldnames=self._fields, extrasaction='ignore'
         )
@@ -112,10 +141,58 @@ class FindingsWriter:
             self._fh.flush()
             self._count += 1
 
-    def close(self) -> None:
+    def record_outcomes(self, outcomes) -> None:
+        self._outcomes = [
+            {'target': o.target, 'complete': o.complete, 'issues': o.issues}
+            for o in outcomes
+        ]
+
+    def close(self, error: BaseException | None = None) -> None:
+        if self._closed:
+            return
+        self._closed = True
         self._fh.close()
-        log.info("Wrote %d finding(s) → %s", self._count, self._path)
-        self._prune_old_runs()
+        status = 'incomplete' if error else ('sample' if self._sample or self._narrows_previous_scope() else 'complete')
+        destination = self._path if status == 'complete' else self._path.with_suffix(f'.{status}.csv')
+        manifest = {
+            'status': status, 'scope': self._scope,
+            'started_at': self._started_at,
+            'finished_at': datetime.now(timezone.utc).isoformat(),
+            'finding_count': self._count, 'tasks': self._outcomes,
+            'error': str(error) if error else None,
+        }
+        # Publish metadata before the CSV, so a new run is never visible to
+        # readers without its status. Legacy CSVs remain readable.
+        manifest_path = destination.with_suffix('.json')
+        manifest_path.write_text(json.dumps(manifest, indent=2), encoding='utf-8')
+        self._staged_path.replace(destination)
+        self._reservation.unlink(missing_ok=True)
+        log.info('Wrote %d finding(s), status=%s → %s', self._count, status, destination)
+        if status == 'complete':
+            self._prune_old_runs()
+
+    def _narrows_previous_scope(self) -> bool:
+        """A smaller account set must not retire findings from unscanned accounts."""
+        current = set(self._scope.get('accounts', []))
+        if not current:
+            return False
+        candidates = sorted(
+            p for p in self._path.parent.glob(f'{self._script_name}_*.csv')
+            if re.match(rf'^{re.escape(self._script_name)}_\d{{8}}_\d{{6}}\.csv$', p.name)
+        )
+        if not candidates:
+            return False
+        previous = candidates[-1]
+        manifest_path = previous.with_suffix('.json')
+        if manifest_path.exists():
+            previous_accounts = set(json.loads(manifest_path.read_text(encoding='utf-8')).get('scope', {}).get('accounts', []))
+        else:
+            with previous.open(newline='', encoding='utf-8-sig') as fh:
+                previous_accounts = {row.get('account_id', '') for row in csv.DictReader(fh)} - {''}
+        if not previous_accounts <= current:
+            log.warning('Narrower account scope retained as sample; use a separate output directory for a new scope')
+            return True
+        return False
 
     def _prune_old_runs(self) -> None:
         """Delete this script's older timestamped CSVs beyond `keep_runs`.
@@ -138,6 +215,7 @@ class FindingsWriter:
         for f in stale:
             try:
                 f.unlink()
+                f.with_suffix('.json').unlink(missing_ok=True)
                 log.info("Pruned old findings CSV: %s", f)
             except OSError as exc:
                 log.warning("Could not prune %s: %s", f, exc)
@@ -145,8 +223,10 @@ class FindingsWriter:
     def __enter__(self) -> FindingsWriter:
         return self
 
-    def __exit__(self, *_) -> None:
-        self.close()
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        if exc is not None:
+            self.record_outcomes(getattr(exc, 'outcomes', []))
+        self.close(error=exc)
 
 
 def _flatten_tags(tags: dict | list | None) -> str:

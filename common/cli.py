@@ -116,9 +116,17 @@ def run(
         iterator_kwargs['regions'] = regions
         iterator_kwargs['max_regions'] = args.max_regions
 
+    if not accounts or any(len(a) != 12 or not a.isdigit() for a in accounts):
+        raise ValueError('--accounts must contain 12-digit AWS account IDs')
+    for name in ('workers', 'max_accounts', 'max_regions', 'keep_runs'):
+        value = getattr(args, name, None)
+        if value is not None and value < 1:
+            raise ValueError(f'--{name.replace("_", "-")} must be positive')
+    sample = bool(args.max_accounts or getattr(args, 'max_regions', None) or regions)
     keep_runs = None if getattr(args, 'no_prune', False) else args.keep_runs
     with output.FindingsWriter(
-        args.output_dir, script_name, extra_fields, keep_runs=keep_runs
+        args.output_dir, script_name, extra_fields, keep_runs=keep_runs,
+        sample=sample, scope={'accounts': sorted(set(accounts)), 'regions': regions or 'enabled'},
     ) as writer:
         with session.AccountIterator(accounts, **iterator_kwargs) as it:
             tasks = it.iter_accounts() if account_level else it.iter_regions()
@@ -127,10 +135,11 @@ def run(
             task_list = list(tasks)
             if task_expander is not None:
                 task_list = [exp for t in task_list for exp in task_expander(t)]
-            session.run_parallel(
+            outcomes = session.run_parallel(
                 ((*task, writer) for task in task_list),
                 scan_fn,
                 max_workers=args.workers,
             )
+            writer.record_outcomes(outcomes)
 
     log.info("Done.")

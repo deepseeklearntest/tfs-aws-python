@@ -31,21 +31,38 @@ EXTRA_FIELDS = [
 
 # AWS Lambda runtime EOL dates (date support ended or will end).
 # Source: https://docs.aws.amazon.com/lambda/latest/dg/lambda-runtimes.html
+# Verified against the AWS runtime table on 2026-10-06. Forecast dates can
+# change; review this table at least every 90 days and before remediation.
+RUNTIME_TABLE_VERIFIED_ON = date(2026, 10, 6)
 RUNTIME_EOL: dict[str, date] = {
-    'dotnetcore2.1': date(2022, 7, 14),
-    'dotnetcore3.1': date(2023, 12, 3),
-    'nodejs14.x':    date(2023, 11, 27),
-    'python3.7':     date(2023, 11, 27),
-    'ruby2.7':       date(2023, 12, 7),
-    'go1.x':         date(2023, 12, 31),
-    'java8':         date(2023, 12, 31),
-    'nodejs16.x':    date(2024, 3, 11),
-    'python3.8':     date(2025, 2, 28),
-    'nodejs18.x':    date(2025, 9, 1),
-    # warn-soon
-    'python3.9':     date(2025, 11, 14),
-    'nodejs20.x':    date(2026, 4, 30),
+    'nodejs': date(2016, 8, 30), 'nodejs4.3': date(2020, 3, 5),
+    'nodejs4.3-edge': date(2020, 3, 5), 'nodejs6.10': date(2019, 8, 12),
+    'nodejs8.10': date(2020, 3, 6), 'nodejs10.x': date(2021, 7, 30),
+    'nodejs12.x': date(2023, 3, 31), 'nodejs14.x': date(2023, 12, 4),
+    'nodejs16.x': date(2024, 6, 12), 'nodejs18.x': date(2025, 9, 1),
+    'nodejs20.x': date(2026, 4, 30), 'nodejs22.x': date(2027, 4, 30),
+    'nodejs24.x': date(2028, 4, 30),
+    'python2.7': date(2021, 7, 15), 'python3.6': date(2022, 7, 18),
+    'python3.7': date(2023, 12, 4), 'python3.8': date(2024, 10, 14),
+    'python3.9': date(2025, 12, 15), 'python3.10': date(2026, 10, 31),
+    'python3.11': date(2027, 6, 30), 'python3.12': date(2028, 10, 31),
+    'python3.13': date(2029, 6, 30), 'python3.14': date(2029, 6, 30),
+    'ruby2.5': date(2021, 7, 30), 'ruby2.7': date(2023, 12, 7),
+    'ruby3.2': date(2026, 3, 31), 'ruby3.3': date(2027, 3, 31),
+    'ruby3.4': date(2028, 3, 31), 'ruby4.0': date(2029, 3, 31),
+    'dotnetcore1.0': date(2019, 6, 27), 'dotnetcore2.0': date(2019, 5, 30),
+    'dotnetcore2.1': date(2022, 1, 5), 'dotnetcore3.1': date(2023, 4, 3),
+    'dotnet6': date(2024, 12, 20), 'dotnet8': date(2026, 11, 10),
+    'dotnet10': date(2028, 11, 14),
+    'java8': date(2024, 1, 8), 'java8.al2': date(2027, 6, 30),
+    'java11': date(2027, 6, 30), 'java17': date(2027, 6, 30),
+    'java8.al2023': date(2029, 6, 30), 'java11.al2023': date(2029, 6, 30),
+    'java17.al2023': date(2029, 6, 30), 'java21': date(2029, 6, 30),
+    'java25': date(2029, 6, 30), 'go1.x': date(2024, 1, 8),
+    'provided': date(2024, 1, 8), 'provided.al2': date(2026, 7, 31),
+    'provided.al2023': date(2029, 6, 30),
 }
+UNSCHEDULED_RUNTIMES = {'nodejs26.x', 'python3.15'}
 
 # Runtimes flagged as eol-soon when within this many days of their EOL date.
 WARN_SOON_DAYS = 180
@@ -63,6 +80,8 @@ def _classify(runtime: str, today: date) -> tuple[str, str, str, str, str] | Non
     """
     eol = RUNTIME_EOL.get(runtime)
     if eol is None:
+        if runtime and runtime not in UNSCHEDULED_RUNTIMES:
+            session.mark_incomplete(f'Unknown Lambda runtime: {runtime}')
         return None
 
     eol_str = eol.isoformat()
@@ -80,6 +99,8 @@ def _classify(runtime: str, today: date) -> tuple[str, str, str, str, str] | Non
 def scan(sess, account_id: str, region: str, writer) -> None:
     lambda_client = sess.client('lambda', region_name=region)
     today = date.today()
+    if (today - RUNTIME_TABLE_VERIFIED_ON).days > 90:
+        log.warning('Lambda runtime date table is more than 90 days old; verify against AWS docs')
 
     try:
         paginator = lambda_client.get_paginator('list_functions')

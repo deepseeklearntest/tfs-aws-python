@@ -2,7 +2,10 @@
 """Task 43 — Tagging Compliance
 
 Identifies AWS resources missing mandatory organisational tags using the
-Resource Groups Tagging API. Produces two finding types per resource:
+Resource Groups Tagging API plus Resource Explorer for never-tagged resources.
+Requires an unrestricted regional Resource Explorer default view including tags.
+Coverage is limited to supported/indexed resource types in the configured shards.
+Produces two finding types per resource:
 
   missing-required-tags  — one or more required tags absent entirely
   inconsistent-tag-key   — required tag present but under a non-canonical key
@@ -337,6 +340,18 @@ for _canonical, _aliases in TAG_ALIASES.items():
         _ALIAS_LOOKUP[tagutil.normalize_key(_alias)] = _canonical
 
 
+def _resource_type_from_arn(arn: str) -> str:
+    """GetResources returns an ARN and tags, never a ResourceType field."""
+    parts = arn.split(':', 5)
+    if len(parts) != 6:
+        raise ValueError(f"Invalid resource ARN: {arn}")
+    service, resource = parts[2], parts[5]
+    kind = resource.lstrip('/').split('/', 1)[0].split(':', 1)[0]
+    if service == 's3' and not parts[3] and not parts[4]:
+        return 's3:bucket'
+    return f'{service}:{kind}'
+
+
 def _name_from_arn(arn: str) -> str:
     # arn:aws:lambda:us-east-1:123:function:my-function  -> my-function
     # arn:aws:ec2:us-east-1:123:instance/i-abc123        -> i-abc123
@@ -393,6 +408,50 @@ def _resolve_tags(tags: list) -> tuple[list[str], list[tuple[str, str]]]:
     return missing, inconsistent
 
 
+def _iter_resources(tagging, explorer, shard: list[str], region: str):
+    """Merge tagged inventory with Resource Explorer's indexed untagged resources.
+
+    An unrestricted view including tags is required. A missing view, a filtered
+    view, or the 1,000-result search cap makes the task incomplete rather than
+    silently dropping never-tagged resources. Coverage remains limited to AWS's
+    supported/indexed resource types and the configured shards.
+    """
+    view_arn = explorer.get_default_view()['ViewArn']
+    view = explorer.get_view(ViewArn=view_arn)['View']
+    if view.get('Filters', {}).get('FilterString', '').strip():
+        raise session.IncompleteScanError('Resource Explorer view must not filter the inventory')
+    if not any(p.get('Name') == 'tags' for p in view.get('IncludedProperties', [])):
+        raise session.IncompleteScanError('Resource Explorer view must include tags')
+    seen = set()
+    for page in tagging.get_paginator('get_resources').paginate(ResourceTypeFilters=shard):
+        for resource in page.get('ResourceTagMappingList', []):
+            seen.add(resource['ResourceARN'])
+            yield resource
+    for resource_type in shard:
+        term = f'resourcetype:{resource_type}' if ':' in resource_type else f'service:{resource_type}'
+        regions = [region]
+        if region == 'us-east-1' and resource_type.split(':')[0] in {'s3', 'iam', 'route53', 'cloudfront'}:
+            regions.append('global')
+        for target_region in regions:
+            query = f'tag:none -tag.key:aws* resourcetype.supports:tags {term} region:{target_region}'
+            kwargs = {'QueryString': query, 'ViewArn': view_arn, 'MaxResults': 100}
+            while True:
+                response = explorer.search(**kwargs)
+                if not response.get('Count', {}).get('Complete', False):
+                    raise session.IncompleteScanError(f'Resource Explorer search truncated: {resource_type}/{target_region}')
+                for resource in response.get('Resources', []):
+                    arn = resource['Arn']
+                    if arn not in seen:
+                        seen.add(arn)
+                        tags = next((p.get('Data', []) for p in resource.get('Properties', [])
+                                     if p.get('Name') == 'tags'), [])
+                        yield {'ResourceARN': arn, 'Tags': tags}
+                token = response.get('NextToken')
+                if not token:
+                    break
+                kwargs['NextToken'] = token
+
+
 def scan(sess, account_id: str, region: str, shard: list[str], writer) -> None:
     """Scan one resource-type shard in one account/region for tagging compliance.
 
@@ -402,74 +461,74 @@ def scan(sess, account_id: str, region: str, shard: list[str], writer) -> None:
     pool — no nested pools, concurrency stays bounded by --workers.
     """
     tagging = sess.client('resourcegroupstaggingapi', region_name=region, config=_RETRY_CFG)
+    explorer = sess.client('resource-explorer-2', region_name=region, config=_RETRY_CFG)
     shard_label = ','.join(shard[:3]) + (',...' if len(shard) > 3 else '')
     try:
-        paginator = tagging.get_paginator('get_resources')
-        for page in paginator.paginate(ResourceTypeFilters=shard):
-            for resource in page.get('ResourceTagMappingList', []):
-                resource_type = resource.get('ResourceType', '')
+        for resource in _iter_resources(tagging, explorer, shard, region):
+            resource_type = _resource_type_from_arn(resource['ResourceARN'])
 
-                # Layer 1: drop infrastructure primitives (belt-and-suspenders —
-                # ResourceTypeFilters already narrows what the API returns, but
-                # some primitives can still appear in broad filter responses).
-                if resource_type in EXCLUDED_RESOURCE_TYPES:
-                    continue
+            # Layer 1: drop infrastructure primitives (belt-and-suspenders —
+            # ResourceTypeFilters already narrows what the API returns, but
+            # some primitives can still appear in broad filter responses).
+            if resource_type in EXCLUDED_RESOURCE_TYPES:
+                continue
 
-                tags = resource.get('Tags', [])
+            tags = resource.get('Tags', [])
 
-                # Layer 2: drop resources managed by a controller (ASG, EKS
-                # nodegroup, eksctl, Beanstalk, CloudFormation, etc.). These
-                # are org-tagged at the parent level, not individually.
-                if any(t['Key'].startswith(MANAGED_TAG_KEY_PREFIXES) for t in tags):
-                    continue
+            # Layer 2: drop resources managed by a controller (ASG, EKS
+            # nodegroup, eksctl, Beanstalk, CloudFormation, etc.). These
+            # are org-tagged at the parent level, not individually.
+            if any(t['Key'].startswith(MANAGED_TAG_KEY_PREFIXES) for t in tags):
+                continue
 
-                missing, inconsistent = _resolve_tags(tags)
+            missing, inconsistent = _resolve_tags(tags)
 
-                if not missing and not inconsistent:
-                    continue
+            if not missing and not inconsistent:
+                continue
 
-                arn = resource['ResourceARN']
-                name = _name_from_arn(arn)
-                total_tag_count = str(len(tags))
+            arn = resource['ResourceARN']
+            name = _name_from_arn(arn)
+            total_tag_count = str(len(tags))
 
-                # Canonical names satisfied exactly, via case variant, or via alias.
-                present = [t for t in REQUIRED_TAGS if t not in missing]
+            # Canonical names satisfied exactly, via case variant, or via alias.
+            present = [t for t in REQUIRED_TAGS if t not in missing]
 
-                def _base_write(finding, detail, **extra):
-                    kwargs = dict(
-                        account_id=account_id,
-                        region=region,
-                        resource_id=arn,
-                        resource_type=resource_type,
-                        finding=finding,
-                        detail=detail,
-                        estimated_monthly_savings_usd=0,
-                        tags=tags,
-                        missing_tags='',
-                        present_tags=', '.join(present),
-                        missing_count='',
-                        total_tag_count=total_tag_count,
-                        inconsistent_keys='',
-                    )
-                    kwargs.update(extra)
-                    writer.write(**kwargs)
+            def _base_write(finding, detail, **extra):
+                kwargs = dict(
+                    account_id=account_id,
+                    region=region,
+                    resource_id=arn,
+                    resource_type=resource_type,
+                    finding=finding,
+                    detail=detail,
+                    estimated_monthly_savings_usd=0,
+                    tags=tags,
+                    missing_tags='',
+                    present_tags=', '.join(present),
+                    missing_count='',
+                    total_tag_count=total_tag_count,
+                    inconsistent_keys='',
+                )
+                kwargs.update(extra)
+                writer.write(**kwargs)
 
-                if missing:
-                    _base_write(
-                        'missing-required-tags',
-                        f"Missing: {', '.join(missing)} "
-                        f"({len(missing)}/{len(REQUIRED_TAGS)} required tags absent) — {name}",
-                        missing_tags=', '.join(missing),
-                        missing_count=str(len(missing)),
-                    )
+            if missing:
+                _base_write(
+                    'missing-required-tags',
+                    f"Missing: {', '.join(missing)} "
+                    f"({len(missing)}/{len(REQUIRED_TAGS)} required tags absent) — {name}",
+                    missing_tags=', '.join(missing),
+                    missing_count=str(len(missing)),
+                )
 
-                if inconsistent:
-                    parts = [f"{actual}->{canonical}" for canonical, actual in inconsistent]
-                    _base_write(
-                        'inconsistent-tag-key',
-                        f"Non-canonical keys: {', '.join(parts)} — {name}",
-                        inconsistent_keys=', '.join(parts),
-                    )
+            if inconsistent:
+                parts = [f"{actual}->{canonical}" for canonical, actual in inconsistent]
+                _base_write(
+                    'inconsistent-tag-key',
+                    f"Non-canonical keys: {', '.join(parts)} — {name}",
+                    inconsistent_keys=', '.join(parts),
+                )
+
 
     except ClientError as exc:
         code = exc.response['Error']['Code']

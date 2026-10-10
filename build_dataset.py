@@ -10,6 +10,7 @@ import argparse
 import csv
 import re
 import sys
+import tempfile
 from datetime import date
 from pathlib import Path
 
@@ -24,6 +25,7 @@ from common.findings_io import (
 
 DATASET_COLUMNS = [
     'snapshot_date',
+    'scan_time',
     'wave',
     'source_script',
     'account_id',
@@ -63,6 +65,7 @@ def normalize_row(row: dict, script_name: str, snapshot_date: str) -> dict:
     tags = parse_tags(row.get('tags', ''))
     return {
         'snapshot_date':                   snapshot_date,
+        'scan_time':                       row.get('scan_time', ''),
         'wave':                            wave,
         'source_script':                   script_name,
         'account_id':                      normalize_account_id(row.get('account_id', '')),
@@ -87,10 +90,17 @@ def normalize_row(row: dict, script_name: str, snapshot_date: str) -> dict:
 def write_dataset(dataset_path: Path, rows: list[dict]) -> None:
     """Write all rows to dataset CSV; creates parent directory if needed."""
     dataset_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(dataset_path, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(f, fieldnames=DATASET_COLUMNS)
-        writer.writeheader()
-        writer.writerows(rows)
+    with tempfile.NamedTemporaryFile('w', newline='', encoding='utf-8',
+                                     dir=dataset_path.parent, delete=False) as f:
+        temporary = Path(f.name)
+        try:
+            writer = csv.DictWriter(f, fieldnames=DATASET_COLUMNS)
+            writer.writeheader()
+            writer.writerows(rows)
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
+    temporary.replace(dataset_path)
 
 
 def print_summary(new_rows: list[dict], all_rows: list[dict], snapshot_date: str) -> None:

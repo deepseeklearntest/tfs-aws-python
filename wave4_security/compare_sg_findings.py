@@ -23,6 +23,9 @@ from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from common.findings_io import is_complete_csv
+
 # Kept in sync with wave4_security/30_detect_open_security_groups.py's
 # SENSITIVE_PORTS — that script is the source of truth for which ports we
 # scan for; duplicated here rather than imported so this tool stays
@@ -56,7 +59,7 @@ def _find_latest_our_csv(findings_dir: Path) -> Path | None:
     candidates = []
     for path in findings_dir.rglob(f"{_OUR_SCRIPT_NAME}_*.csv"):
         m = _TIMESTAMP_RE.search(path.stem)
-        if m:
+        if m and is_complete_csv(path):
             candidates.append((m.group(1), path))
     if not candidates:
         return None
