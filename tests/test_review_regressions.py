@@ -45,6 +45,7 @@ quotas = load('continuous/49_detect_custom_quotas.py')
 tagging = load('continuous/43_detect_tagging_compliance.py')
 inventory = load('continuous/54_inventory_refresh.py')
 compare = load('wave4_security/compare_sg_findings.py')
+clb = load('wave2_lifecycle/16_detect_classic_load_balancers.py')
 
 
 def client(service):
@@ -166,6 +167,70 @@ class ScanPublicationTests(unittest.TestCase):
 
 
 class DetectorTests(unittest.TestCase):
+    def test_clb_deletion_confidence_uses_60_and_90_day_evidence(self):
+        cases = (
+            (0, 0, 0, 0, 'HIGH'),
+            (0, 0, 120, 0, 'MEDIUM'),
+            (0, 0, 0, 2, 'MEDIUM'),
+            (1, 1, 1, 0, 'LOW'),
+            (1, 0, 0, 0, 'LOW'),
+            (0, 0, -1, 0, 'LOW'),
+        )
+        for count_30d, count_60d, count_90d, instance_count, expected in cases:
+            with self.subTest(count_30d=count_30d, count_60d=count_60d,
+                              count_90d=count_90d, instance_count=instance_count):
+                self.assertEqual(
+                    clb._deletion_confidence(
+                        count_30d, count_60d, count_90d, instance_count
+                    ),
+                    expected,
+                )
+
+    def test_clb_deployment_source_requires_cloudformation_tags(self):
+        self.assertEqual(
+            clb._deployment_source([{'Key': 'aws:cloudformation:stack-name'}]),
+            'CloudFormation',
+        )
+        self.assertEqual(clb._deployment_source([]), 'Manual/Other')
+        self.assertEqual(clb._deployment_source([], tags_available=False), 'Unknown')
+
+    def test_clb_scan_reports_90_day_confidence_and_deployment_source(self):
+        elb = Mock()
+        elb.get_paginator.return_value.paginate.return_value = [{
+            'LoadBalancerDescriptions': [{
+                'LoadBalancerName': 'legacy-clb',
+                'Instances': [],
+                'ListenerDescriptions': [],
+            }],
+        }]
+        elb.describe_tags.return_value = {'TagDescriptions': [{
+            'Tags': [{'Key': 'aws:cloudformation:stack-name', 'Value': 'legacy-stack'}],
+        }]}
+        cw = Mock()
+        cw.get_metric_statistics.return_value = {'Datapoints': []}
+        sess = Mock()
+        sess.client.side_effect = lambda service, **kwargs: {
+            'elb': elb, 'cloudwatch': cw, 'ec2': Mock(),
+        }[service]
+        writer = Mock()
+
+        clb.scan(sess, ACCOUNT, 'us-east-1', writer)
+
+        row = writer.write.call_args.kwargs
+        self.assertEqual(row['request_count_30d'], '0')
+        self.assertEqual(row['request_count_60d'], '0')
+        self.assertEqual(row['request_count_90d'], '0')
+        self.assertEqual(row['deletion_confidence'], 'HIGH')
+        self.assertEqual(row['deployment_source'], 'CloudFormation')
+        self.assertIn('requests_90d=0', row['detail'])
+        self.assertEqual(cw.get_metric_statistics.call_count, 3)
+        for call, expected_days in zip(cw.get_metric_statistics.call_args_list, (30, 60, 90)):
+            self.assertEqual(
+                (call.kwargs['EndTime'] - call.kwargs['StartTime']).days,
+                expected_days,
+            )
+            self.assertEqual(call.kwargs['Period'], 2 * 60 * 60)
+
     def test_iam_fetches_get_role_for_active_role(self):
         iam = client('iam')
         now = datetime.now(timezone.utc)

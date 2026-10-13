@@ -62,10 +62,15 @@ What to do with findings from each script, and how to pitch it to management.
 
 ### 16. Classic Load Balancers
 
-1. **Zero-traffic CLBs** (`request_count_30d = 0`): Delete immediately. No traffic means no blast radius.
+1. **Assess deletion confidence** using `deletion_confidence` and the 30-, 60-, and 90-day request counts:
+   - `HIGH`: no requests for 90 days and no registered instances.
+   - `MEDIUM`: no requests for 60 days, but either instances remain registered or requests occurred 61-90 days ago.
+   - `LOW`: requests occurred in the last 60 days, or CloudWatch metrics were unavailable.
+   Treat `HIGH` as the strongest deletion candidate, but still verify dependencies before deleting. Review `MEDIUM` candidates with the workload owner; investigate `LOW` candidates rather than treating them as idle.
 2. **Active CLBs**: The `migration_target` column tells you exactly where to go — `ALB` for HTTP/HTTPS listeners, `NLB` for TCP/UDP/SSL.
 3. Migration steps: create the new LB, update the Route 53 alias record, monitor traffic for one full cycle, then delete the CLB. Keep both running in parallel until you're confident.
 4. CLBs also lack WAF integration, advanced routing rules, and gRPC support — migration unlocks all of these at no additional cost.
+5. **Deployment source**: `CloudFormation` means CloudFormation stack tags were found. `Manual/Other` means no such tag was present (it may also be managed by another tool); `Unknown` means the tags could not be read.
 
 **Pitch:** Classic Load Balancers are a legacy product with no new feature development. We can't add WAF or path-based routing to a CLB. Zero-traffic ones are pure cost with no value. We already have the migration target recommendation for each one in the CSV — the analysis work is done.
 
