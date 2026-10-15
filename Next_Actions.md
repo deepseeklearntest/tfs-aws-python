@@ -71,6 +71,7 @@ What to do with findings from each script, and how to pitch it to management.
 3. Migration steps: create the new LB, update the Route 53 alias record, monitor traffic for one full cycle, then delete the CLB. Keep both running in parallel until you're confident.
 4. CLBs also lack WAF integration, advanced routing rules, and gRPC support — migration unlocks all of these at no additional cost.
 5. **Deployment source**: `CloudFormation` means CloudFormation stack tags were found. `Manual/Other` means no such tag was present (it may also be managed by another tool); `Unknown` means the tags could not be read.
+6. **Stopped backend instances**: `backend_instance_details` includes each registered instance's current state and, when EC2 reports a parseable stop transition, its UTC stopped-since time and elapsed whole days. A missing stopped time is reported as unknown; it is not inferred from launch time.
 
 **Pitch:** Classic Load Balancers are a legacy product with no new feature development. We can't add WAF or path-based routing to a CLB. Zero-traffic ones are pure cost with no value. We already have the migration target recommendation for each one in the CSV — the analysis work is done.
 

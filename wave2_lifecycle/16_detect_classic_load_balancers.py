@@ -14,6 +14,7 @@ Extra columns:
   request_count_90d     - requests over the last 90 days
   deletion_confidence   - HIGH, MEDIUM, or LOW confidence in deletion being safe
   deployment_source     - CloudFormation when its stack tags exist, otherwise Manual/Other
+  backend_instance_details - registered instance state and stopped time/age, when available
   instance_owner_source - how the COMMON_FIELDS 'owner' column was resolved: clb-tag
                           (the CLB's own tags), instance-consensus (registered instances
                           agree on an owner), instance-mixed (they disagree - see detail
@@ -23,7 +24,9 @@ Run: python 16_detect_classic_load_balancers.py --accounts 123456789012,23456789
 """
 from __future__ import annotations
 
+import json
 import logging
+import re
 import sys
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -39,7 +42,7 @@ EXTRA_FIELDS = [
     'dns_name', 'scheme', 'instance_count', 'created_time', 'availability_zones',
     'age_days', 'listener_protocols', 'migration_target', 'request_count_30d',
     'request_count_60d', 'request_count_90d', 'deletion_confidence',
-    'deployment_source',
+    'deployment_source', 'backend_instance_details',
     'instance_owner_source',
 ]
 
@@ -47,6 +50,9 @@ EXTRA_FIELDS = [
 ALB_PROTOCOLS = {'HTTP', 'HTTPS'}
 REQUEST_WINDOWS_DAYS = (30, 60, 90)
 REQUEST_METRIC_PERIOD_SECONDS = 2 * 60 * 60
+STOP_REASON_TIMESTAMP = re.compile(
+    r'\((\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?)\s+(?:GMT|UTC)\)\s*$'
+)
 
 log = logging.getLogger(SCRIPT_NAME)
 
@@ -72,35 +78,83 @@ def _deployment_source(tags: list[dict], tags_available: bool = True) -> str:
     return 'Manual/Other'
 
 
-def _resolve_instance_owner(ec2, instance_ids: list[str]) -> tuple[str, str, list[str]]:
-    """Return (owner_value, source, distinct_owners) from registered instances' tags.
+def _stopped_at_from_reason(reason: str) -> datetime | None:
+    match = STOP_REASON_TIMESTAMP.search(reason)
+    if not match:
+        return None
+    try:
+        return datetime.fromisoformat(match.group(1).replace(' ', 'T')).replace(
+            tzinfo=timezone.utc
+        )
+    except ValueError:
+        return None
+
+
+def _inspect_backend_instances(
+    ec2, instance_ids: list[str], now: datetime,
+) -> tuple[str, str, list[str], list[dict]]:
+    """Return owner data and current state/stop-age details for registered instances.
 
     Uses common.tags.owner_from_tags (the shared owner-alias resolver also used by
     common/output.py's default 'owner' column) against each instance's own tags.
-    owner_value is empty when no instance resolves an owner, the single shared
-    value when all tagged instances agree, or "mixed" when they don't.
-    distinct_owners lists the candidate values found (0, 1, or more entries) so
-    callers can surface them in the finding detail when the result is mixed.
+    The EC2 StateTransitionReason timestamp is used only when the instance is
+    currently stopped; missing or unparseable timestamps remain unknown.
     """
     owners: set[str] = set()
+    instances: dict[str, dict] = {}
     try:
         for batch in session.chunked(instance_ids, 100):
             resp = ec2.describe_instances(InstanceIds=batch)
             for reservation in resp.get('Reservations', []):
                 for inst in reservation.get('Instances', []):
+                    instance_id = inst.get('InstanceId')
+                    state = inst.get('State', {}).get('Name', 'unknown')
+                    stopped_at = (
+                        _stopped_at_from_reason(inst.get('StateTransitionReason', ''))
+                        if state == 'stopped' else None
+                    )
+                    stopped_days = (
+                        (now - stopped_at).days
+                        if stopped_at is not None and stopped_at <= now
+                        else None
+                    )
+                    if instance_id:
+                        instances[instance_id] = {
+                            'instance_id': instance_id,
+                            'state': state,
+                            'stopped_since': stopped_at.isoformat() if stopped_at else None,
+                            'stopped_days': stopped_days,
+                        }
                     owner = tagutil.owner_from_tags(inst.get('Tags', []))
                     if owner:
                         owners.add(owner)
     except ClientError as exc:
         if session.is_skippable(exc):
-            return '', 'none', []
+            unknown_instances = [
+                {
+                    'instance_id': instance_id,
+                    'state': 'unknown',
+                    'stopped_since': None,
+                    'stopped_days': None,
+                }
+                for instance_id in sorted(instance_ids)
+            ]
+            return '', 'none', [], unknown_instances
         raise
+    for instance_id in instance_ids:
+        instances.setdefault(instance_id, {
+            'instance_id': instance_id,
+            'state': 'unknown',
+            'stopped_since': None,
+            'stopped_days': None,
+        })
     distinct = sorted(owners)
+    details = [instances[instance_id] for instance_id in sorted(instances)]
     if not owners:
-        return '', 'none', distinct
+        return '', 'none', distinct, details
     if len(owners) == 1:
-        return distinct[0], 'instance-consensus', distinct
-    return 'mixed', 'instance-mixed', distinct
+        return distinct[0], 'instance-consensus', distinct, details
+    return 'mixed', 'instance-mixed', distinct, details
 
 
 def _get_request_counts(cw, name: str) -> tuple[int, int, int]:
@@ -198,17 +252,34 @@ def scan(sess, account_id: str, region: str, writer) -> None:
 
                 clb_owner = tagutil.owner_from_tags(tags)
                 mixed_owners: list[str] = []
+                instance_ids = [
+                    i['InstanceId'] for i in lb.get('Instances', []) if i.get('InstanceId')
+                ]
+                backend_instance_details: list[dict] = []
+                if instance_ids:
+                    (
+                        resolved_owner, instance_owner_source, mixed_owners,
+                        backend_instance_details,
+                    ) = _inspect_backend_instances(ec2, instance_ids, now)
+                else:
+                    resolved_owner, instance_owner_source = '', 'none'
                 if clb_owner:
                     instance_owner, instance_owner_source = clb_owner, 'clb-tag'
-                elif instance_count > 0:
-                    instance_ids = [
-                        i['InstanceId'] for i in lb.get('Instances', []) if i.get('InstanceId')
-                    ]
-                    instance_owner, instance_owner_source, mixed_owners = _resolve_instance_owner(
-                        ec2, instance_ids
-                    )
                 else:
-                    instance_owner, instance_owner_source = '', 'none'
+                    instance_owner = resolved_owner
+
+                stopped_instance_ages = [
+                    (
+                        f"{instance['instance_id']}={instance['stopped_days']}d"
+                        if instance['stopped_days'] is not None
+                        else f"{instance['instance_id']}=unknown"
+                    )
+                    for instance in backend_instance_details
+                    if instance['state'] == 'stopped'
+                ]
+                stopped_instance_ages_str = (
+                    ';'.join(stopped_instance_ages) if stopped_instance_ages else 'none'
+                )
 
                 if deletion_confidence in {'HIGH', 'MEDIUM'}:
                     finding = 'classic-load-balancer - low recent traffic, deletion candidate'
@@ -237,6 +308,7 @@ def scan(sess, account_id: str, region: str, writer) -> None:
                         f"requests_90d={request_strings[2]} "
                         f"deletion_confidence={deletion_confidence} "
                         f"deployment_source={deployment_source} "
+                        f"backend_instance_stopped_days={stopped_instance_ages_str} "
                         f"dns={dns_name}{detail_owner}"
                     ),
                     estimated_monthly_savings_usd=round(monthly_cost, 2),
@@ -255,6 +327,7 @@ def scan(sess, account_id: str, region: str, writer) -> None:
                     request_count_90d=request_strings[2],
                     deletion_confidence=deletion_confidence,
                     deployment_source=deployment_source,
+                    backend_instance_details=json.dumps(backend_instance_details),
                     instance_owner_source=instance_owner_source,
                 )
     except ClientError as exc:

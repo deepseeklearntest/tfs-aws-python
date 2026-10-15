@@ -194,6 +194,58 @@ class DetectorTests(unittest.TestCase):
         self.assertEqual(clb._deployment_source([]), 'Manual/Other')
         self.assertEqual(clb._deployment_source([], tags_available=False), 'Unknown')
 
+    def test_clb_backend_stopped_age_uses_current_stop_transition(self):
+        ec2 = Mock()
+        ec2.describe_instances.return_value = {'Reservations': [{
+            'Instances': [
+                {
+                    'InstanceId': 'i-stopped',
+                    'State': {'Name': 'stopped'},
+                    'StateTransitionReason': 'User initiated (2026-10-10 12:30:00 GMT)',
+                    'Tags': [],
+                },
+                {
+                    'InstanceId': 'i-running',
+                    'State': {'Name': 'running'},
+                    'StateTransitionReason': 'User initiated (2026-10-10 12:30:00 GMT)',
+                    'Tags': [],
+                },
+                {
+                    'InstanceId': 'i-no-time',
+                    'State': {'Name': 'stopped'},
+                    'StateTransitionReason': '',
+                    'Tags': [],
+                },
+            ],
+        }]}
+        now = datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc)
+
+        owner, source, owners, details = clb._inspect_backend_instances(
+            ec2, ['i-stopped', 'i-running', 'i-no-time'], now
+        )
+
+        self.assertEqual((owner, source, owners), ('', 'none', []))
+        self.assertEqual(details, [
+            {
+                'instance_id': 'i-no-time',
+                'state': 'stopped',
+                'stopped_since': None,
+                'stopped_days': None,
+            },
+            {
+                'instance_id': 'i-running',
+                'state': 'running',
+                'stopped_since': None,
+                'stopped_days': None,
+            },
+            {
+                'instance_id': 'i-stopped',
+                'state': 'stopped',
+                'stopped_since': '2026-10-10T12:30:00+00:00',
+                'stopped_days': 4,
+            },
+        ])
+
     def test_clb_scan_reports_90_day_confidence_and_deployment_source(self):
         elb = Mock()
         elb.get_paginator.return_value.paginate.return_value = [{
@@ -222,7 +274,9 @@ class DetectorTests(unittest.TestCase):
         self.assertEqual(row['request_count_90d'], '0')
         self.assertEqual(row['deletion_confidence'], 'HIGH')
         self.assertEqual(row['deployment_source'], 'CloudFormation')
+        self.assertEqual(row['backend_instance_details'], '[]')
         self.assertIn('requests_90d=0', row['detail'])
+        self.assertIn('backend_instance_stopped_days=none', row['detail'])
         self.assertEqual(cw.get_metric_statistics.call_count, 3)
         for call, expected_days in zip(cw.get_metric_statistics.call_args_list, (30, 60, 90)):
             self.assertEqual(
@@ -230,6 +284,46 @@ class DetectorTests(unittest.TestCase):
                 expected_days,
             )
             self.assertEqual(call.kwargs['Period'], 2 * 60 * 60)
+
+    def test_clb_scan_writes_registered_backend_stop_age(self):
+        elb = Mock()
+        elb.get_paginator.return_value.paginate.return_value = [{
+            'LoadBalancerDescriptions': [{
+                'LoadBalancerName': 'legacy-clb',
+                'Instances': [{'InstanceId': 'i-backend'}],
+                'ListenerDescriptions': [],
+            }],
+        }]
+        elb.describe_tags.return_value = {'TagDescriptions': [{'Tags': []}]}
+        cw = Mock()
+        cw.get_metric_statistics.return_value = {'Datapoints': []}
+        stopped_at = datetime.now(timezone.utc) - timedelta(days=3)
+        ec2 = Mock()
+        ec2.describe_instances.return_value = {'Reservations': [{
+            'Instances': [{
+                'InstanceId': 'i-backend',
+                'State': {'Name': 'stopped'},
+                'StateTransitionReason': (
+                    f"User initiated ({stopped_at.strftime('%Y-%m-%d %H:%M:%S')} GMT)"
+                ),
+                'Tags': [],
+            }],
+        }]}
+        sess = Mock()
+        sess.client.side_effect = lambda service, **kwargs: {
+            'elb': elb, 'cloudwatch': cw, 'ec2': ec2,
+        }[service]
+        writer = Mock()
+
+        clb.scan(sess, ACCOUNT, 'us-east-1', writer)
+
+        row = writer.write.call_args.kwargs
+        backend_details = json.loads(row['backend_instance_details'])
+        self.assertEqual(backend_details[0]['instance_id'], 'i-backend')
+        self.assertEqual(backend_details[0]['state'], 'stopped')
+        self.assertEqual(backend_details[0]['stopped_days'], 3)
+        self.assertIn('backend_instance_stopped_days=i-backend=3d', row['detail'])
+        self.assertEqual(row['deletion_confidence'], 'MEDIUM')
 
     def test_iam_fetches_get_role_for_active_role(self):
         iam = client('iam')
