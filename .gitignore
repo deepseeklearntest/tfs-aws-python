@@ -1,5 +1,6 @@
 # Saved Britive credentials — never commit real credentials
 britive_creds.json
+britive_creds_back.json
 .env
 .env.*
 !.env.example

@@ -72,9 +72,13 @@ using aggregate dollar totals. Confirm workload peaks and dependencies before
 reducing capacity or deleting an idle candidate. Missing metrics are unknown,
 not measured zero usage.
 
-The Lambda runtime date table was verified against [AWS runtime documentation](https://docs.aws.amazon.com/lambda/latest/dg/lambda-runtimes.html)
-on 2026-10-06. Forecast dates can change. Review it at least every 90 days; stale
-tables produce a scan warning. Unknown runtimes make the scan incomplete.
+The Lambda runtime lifecycle and security-risk detector is strictly read-only.
+Its scheduled lifecycle and create/update block dates were checked against
+[AWS runtime documentation](https://docs.aws.amazon.com/lambda/latest/dg/lambda-runtimes.html)
+on 2026-10-27. Forecast dates can change; the detector marks lifecycle data stale
+after 90 days and marks incomplete scans for unknown runtimes or coverage gaps.
+See [the Lambda assessment guide](docs/lambda_runtime_assessment.md) for its
+permissions, optional CloudWatch enrichment, output fields, and limitations.
 
 Generated HTML escapes resource/tag text, and Excel treats external strings as
 literal text. Raw CSVs preserve their data; open the generated Excel report
