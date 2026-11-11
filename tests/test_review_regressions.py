@@ -151,6 +151,11 @@ class ScanPublicationTests(unittest.TestCase):
         with patch.object(session, 'AccountIterator') as iterator:
             iterator.return_value.__enter__.return_value.iter_regions.return_value = [(None, ACCOUNT, 'us-east-1')]
             cli.run(args, self.name, lambda *args: None)
+        self.assertFalse(any(
+            isinstance(handler, logging.FileHandler)
+            and Path(handler.baseFilename).parent == Path(self.temp.name) / 'logs'
+            for handler in logging.getLogger().handlers
+        ))
         self.assertEqual(findings_io.discover_latest_csvs(self.temp.name), [self.old])
         samples = list(self.folder.glob('*.sample.csv'))
         self.assertEqual(len(samples), 1)

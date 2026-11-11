@@ -99,6 +99,23 @@ def run(
     Default None preserves existing behaviour for all other scripts.
     """
     logging_config.setup(args.output_dir, script_name)
+    try:
+        _run(
+            args, script_name, scan_fn, extra_fields=extra_fields,
+            account_level=account_level, task_expander=task_expander,
+        )
+    finally:
+        logging_config.shutdown()
+
+
+def _run(
+    args: argparse.Namespace,
+    script_name: str,
+    scan_fn: Callable,
+    extra_fields: list[str] | None = None,
+    account_level: bool = False,
+    task_expander: Callable | None = None,
+) -> None:
     log = logging.getLogger(script_name)
     log.info("Starting %s", script_name)
 

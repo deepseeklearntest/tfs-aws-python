@@ -6,7 +6,20 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
+_handlers: list[logging.Handler] = []
+
+
+def shutdown() -> None:
+    root = logging.getLogger()
+    for handler in _handlers:
+        root.removeHandler(handler)
+        handler.close()
+    _handlers.clear()
+
+
 def setup(output_dir: str, script_name: str, level: int = logging.INFO) -> None:
+    shutdown()
+
     ts = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')
     log_dir = Path(output_dir) / 'logs'
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -33,6 +46,7 @@ def setup(output_dir: str, script_name: str, level: int = logging.INFO) -> None:
     root.setLevel(level)
     root.addHandler(fh)
     root.addHandler(sh)
+    _handlers.extend((fh, sh))
 
     # Silence noisy SDK loggers unless debug is explicitly requested
     for noisy in ('boto3', 'botocore', 'urllib3'):
